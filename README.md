@@ -1,4 +1,8 @@
-# MySQL setup for vprofile (Ubuntu)
+# vprofile services setup
+
+Setup order: MySQL → Memcached → RabbitMQ → Tomcat → Nginx.
+
+# MySQL setup (db01, Ubuntu)
 
 The application connects to MySQL using these settings from
 `src/main/resources/application.properties`:
@@ -159,3 +163,96 @@ From another VM (for example `app01`), test the login as the application user:
 ```bash
 mysql -h db01 -u admin -padmin123 accounts -e "SHOW TABLES;"
 ```
+
+# Memcached setup (mc01, CentOS Stream 9)
+
+The application connects to Memcached using these settings from
+`src/main/resources/application.properties`:
+
+| Setting | Value   |
+|---------|---------|
+| Host    | `mc01`  |
+| Port    | `11211` |
+
+Log in to the VM:
+
+```bash
+vagrant ssh mc01
+```
+
+Check that `/etc/hosts` has entries for the other VMs (`db01`, `app01`, ...):
+
+```bash
+cat /etc/hosts
+```
+
+## 1. Install Memcached
+
+```bash
+sudo dnf update -y
+sudo dnf install epel-release -y
+sudo dnf install memcached -y
+sudo systemctl start memcached
+sudo systemctl enable memcached
+sudo systemctl status memcached
+```
+
+## 2. Configure Memcached
+
+```bash
+sudo vim /etc/sysconfig/memcached
+```
+
+Set:
+
+```ini
+PORT="11211"
+USER="memcached"
+MAXCONN="1024"
+CACHESIZE="64"
+OPTIONS="-l 0.0.0.0 -U 0"
+```
+
+- `-l 0.0.0.0`: listen on all interfaces. With the default `-l 127.0.0.1`, the Tomcat server (`app01`) cannot reach Memcached.
+- `-U 0`: disable UDP. The app only uses TCP, and an open UDP port can be abused for amplification attacks.
+
+Or do it in one command:
+
+```bash
+sudo sed -i 's/^OPTIONS=.*/OPTIONS="-l 0.0.0.0 -U 0"/' /etc/sysconfig/memcached
+```
+
+Restart Memcached:
+
+```bash
+sudo systemctl restart memcached
+```
+
+## 3. Open port 11211 in the firewall
+
+```bash
+sudo systemctl start firewalld
+sudo systemctl enable firewalld
+sudo firewall-cmd --zone=public --add-port=11211/tcp --permanent
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
+
+## 4. Test the setup
+
+On `mc01`, confirm Memcached is listening on all interfaces:
+
+```bash
+sudo ss -tlnp | grep 11211
+```
+
+Expected: `0.0.0.0:11211`.
+
+From another VM (for example `app01`), check that the port is reachable:
+
+```bash
+sudo dnf install nmap-ncat -y
+echo stats | nc mc01 11211
+```
+
+You should see a list of `STAT ...` lines.
