@@ -342,3 +342,122 @@ nc -zv rmq01 5672
 ```
 
 Expected: `Connected to ...:5672`.
+
+# Tomcat setup (app01, CentOS Stream 9)
+
+Tomcat runs the vprofile application on port `8080`.
+
+Log in to the VM:
+
+```bash
+vagrant ssh app01
+```
+
+Check that `/etc/hosts` has entries for the other VMs (`db01`, `mc01`, `rmq01`, ...):
+
+```bash
+cat /etc/hosts
+```
+
+## 1. Install Java and tools
+
+```bash
+sudo dnf update -y
+sudo dnf install epel-release -y
+sudo dnf install java-17-openjdk java-17-openjdk-devel -y
+sudo dnf install git wget -y
+```
+
+## 2. Download Tomcat
+
+```bash
+cd /tmp/
+wget https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.26/bin/apache-tomcat-10.1.26.tar.gz
+tar xzvf apache-tomcat-10.1.26.tar.gz
+```
+
+## 3. Create the tomcat user and copy the files
+
+```bash
+sudo useradd --home-dir /usr/local/tomcat --shell /sbin/nologin tomcat
+sudo cp -r /tmp/apache-tomcat-10.1.26/* /usr/local/tomcat/
+sudo chown -R tomcat:tomcat /usr/local/tomcat
+```
+
+> Use `tomcat:tomcat`, not `tomcat.tomcat`. The dot form is deprecated, and `chown` prints `warning: '.' should be ':'`.
+
+## 4. Create the systemd service
+
+```bash
+sudo vim /etc/systemd/system/tomcat.service
+```
+
+Content:
+
+```ini
+[Unit]
+Description=Tomcat
+After=network.target
+
+[Service]
+User=tomcat
+Group=tomcat
+WorkingDirectory=/usr/local/tomcat
+Environment=JAVA_HOME=/usr/lib/jvm/jre
+Environment=CATALINA_HOME=/usr/local/tomcat
+Environment=CATALINA_BASE=/usr/local/tomcat
+ExecStart=/usr/local/tomcat/bin/catalina.sh run
+ExecStop=/usr/local/tomcat/bin/shutdown.sh
+RestartSec=10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> Do not add `Environment=CATALINA_PID=/var/tomcat/%i/run/tomcat.pid` (it is in the course PDF).
+> `%i` only works in template units (`tomcat@.service`), `/var/tomcat` does not exist, and `catalina.sh run` never writes a PID file.
+> With that line, `shutdown.sh` fails with `Stop aborted` on every stop and systemd has to kill Tomcat instead.
+
+Start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start tomcat
+sudo systemctl enable tomcat
+sudo systemctl status tomcat
+```
+
+## 5. Open port 8080 in the firewall
+
+firewalld is active on this box and only allows `ssh` by default. Without this step, the browser times out on `http://192.168.56.12:8080/` even though Tomcat is running.
+
+```bash
+sudo systemctl start firewalld
+sudo systemctl enable firewalld
+sudo firewall-cmd --get-active-zones
+sudo firewall-cmd --zone=public --add-port=8080/tcp --permanent
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
+
+## 6. Test the setup
+
+On `app01`, confirm Tomcat is listening and responds:
+
+```bash
+sudo ss -tlnp | grep 8080
+curl -I http://localhost:8080/
+```
+
+Expected: `0.0.0.0:8080` and `HTTP/1.1 200`.
+
+From your computer, open `http://192.168.56.12:8080/`. You should see the Tomcat welcome page.
+
+If the page times out, check the firewall first:
+
+```bash
+sudo firewall-cmd --list-all
+```
+
+`8080/tcp` must appear under `ports:`.
