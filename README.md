@@ -256,3 +256,89 @@ echo stats | nc mc01 11211
 ```
 
 You should see a list of `STAT ...` lines.
+
+# RabbitMQ setup (rmq01, CentOS Stream 9)
+
+The application connects to RabbitMQ using these settings from
+`src/main/resources/application.properties`:
+
+| Setting  | Value   |
+|----------|---------|
+| Host     | `rmq01` |
+| Port     | `5672`  |
+| User     | `test`  |
+| Password | `test`  |
+
+Log in to the VM:
+
+```bash
+vagrant ssh rmq01
+```
+
+Check that `/etc/hosts` has entries for the other VMs (`db01`, `app01`, ...):
+
+```bash
+cat /etc/hosts
+```
+
+## 1. Install RabbitMQ
+
+RabbitMQ is not in the default CentOS repos. Add the CentOS RabbitMQ repo, then install it:
+
+```bash
+sudo dnf update -y
+sudo dnf install epel-release -y
+sudo dnf install wget -y
+sudo dnf install centos-release-rabbitmq-38 -y
+sudo dnf --enablerepo=centos-rabbitmq-38 install rabbitmq-server -y
+sudo systemctl enable --now rabbitmq-server
+sudo systemctl status rabbitmq-server
+```
+
+## 2. Create the application user
+
+Create the `test` user, make it an administrator, and give it full permissions on the default virtual host `/`:
+
+```bash
+sudo rabbitmqctl add_user test test
+sudo rabbitmqctl set_user_tags test administrator
+sudo rabbitmqctl set_permissions -p / test ".*" ".*" ".*"
+```
+
+> `set_permissions` takes three patterns: configure, write and read. With only one (`".*"`), the command fails.
+
+Check the user:
+
+```bash
+sudo rabbitmqctl list_users
+sudo rabbitmqctl list_permissions -p /
+```
+
+## 3. Open port 5672 in the firewall
+
+```bash
+sudo systemctl start firewalld
+sudo systemctl enable firewalld
+sudo firewall-cmd --zone=public --add-port=5672/tcp --permanent
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
+
+## 4. Test the setup
+
+On `rmq01`, confirm RabbitMQ is listening on port 5672:
+
+```bash
+sudo ss -tlnp | grep 5672
+```
+
+Expected: `*:5672` or `0.0.0.0:5672`. RabbitMQ listens on all interfaces by default.
+
+From another VM (for example `app01`), check that the port is reachable:
+
+```bash
+sudo dnf install nmap-ncat -y
+nc -zv rmq01 5672
+```
+
+Expected: `Connected to ...:5672`.
