@@ -290,10 +290,36 @@ sudo dnf update -y
 sudo dnf install epel-release -y
 sudo dnf install wget -y
 sudo dnf install centos-release-rabbitmq-38 -y
+
+# Stop EPEL from providing Erlang (see the note below)
+sudo sed -i '/^\[epel\]$/a excludepkgs=erlang*' /etc/yum.repos.d/epel.repo
+sudo sed -i '/^\[epel-next\]$/a excludepkgs=erlang*' /etc/yum.repos.d/epel-next.repo
+
 sudo dnf --enablerepo=centos-rabbitmq-38 install rabbitmq-server -y
 sudo systemctl enable --now rabbitmq-server
 sudo systemctl status rabbitmq-server
 ```
+
+Check that RabbitMQ runs on Erlang 24, not 26:
+
+```bash
+sudo rabbitmq-diagnostics erlang_version
+```
+
+Expected: `Erlang/OTP 24.x`.
+
+> EPEL ships Erlang 26, which is newer than the Erlang 24 in the CentOS RabbitMQ repo, so `dnf` picks EPEL's version.
+> RabbitMQ 3.9 does not support Erlang 26: it starts fine, but crashes every client connection
+> (`{unexpected_message,{'EXIT',#Port<...>,einval}}` in `/var/log/rabbitmq/rabbit@rmq01.log`),
+> and the app logs `Failed to check/redeclare auto-delete queue(s)` every few seconds.
+>
+> If Erlang 26 is already installed, add the two `excludepkgs` lines above, then:
+>
+> ```bash
+> sudo systemctl stop rabbitmq-server
+> sudo dnf distro-sync "erlang*" -y
+> sudo systemctl start rabbitmq-server
+> ```
 
 ## 2. Create the application user
 
@@ -461,3 +487,23 @@ sudo firewall-cmd --list-all
 ```
 
 `8080/tcp` must appear under `ports:`.
+
+
+############################# install maven 
+cd /tmp/
+wget https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip 
+unzip apache-maven-3.9.9-bin.zip
+cp -r apache-maven-3.9.9 /usr/local/maven3.9
+export MAVEN_OPTS="-Xmx512m"
+
+download
+git clone -b local https://github.com/hkhcoder/vprofile-project.git
+cd vprofile-project
+
+buid code 
+/usr/local/maven3.9/bin/mvn install 
+systemctl stop tomcat
+
+build path :- /tmp/vprofile-project/target/vprofile-v2.war 
+
+rm -rf /usr/local/tomcat/webapps/ROOT* # cp target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war # systemctl start tomcat # chown tomcat.tomcat /usr/local/tomcat/webapps -R # systemctl restart tomcat
