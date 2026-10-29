@@ -2,6 +2,8 @@
 
 Setup order: MySQL → Memcached → RabbitMQ → Tomcat → Nginx.
 
+Monitoring: Nagios (`nagios01`).
+
 # MySQL setup (db01, Ubuntu)
 
 The application connects to MySQL using these settings from
@@ -507,3 +509,273 @@ systemctl stop tomcat
 build path :- /tmp/vprofile-project/target/vprofile-v2.war 
 
 rm -rf /usr/local/tomcat/webapps/ROOT* # cp target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war # systemctl start tomcat # chown tomcat.tomcat /usr/local/tomcat/webapps -R # systemctl restart tomcat
+
+# Nagios setup (nagios01, Ubuntu 22.04)
+
+Nagios Core monitors the other VMs. It is built from source and serves its web interface through Apache on port `80`.
+
+| Setting        | Value                          |
+|----------------|--------------------------------|
+| VM             | `nagios01` (`192.168.56.16`)   |
+| Nagios Core    | `4.5.14`                       |
+| Nagios Plugins | `2.5`                          |
+| Web URL        | `http://192.168.56.16/nagios`  |
+| Web user       | `nagiosadmin`                  |
+
+Log in to the VM:
+
+```bash
+vagrant ssh nagios01
+```
+
+> This VM runs Ubuntu, not CentOS. Use `apt-get`, not `dnf`.
+> The course command `sudo dnf install epel-release -y` fails with `sudo: dnf: command not found`.
+> EPEL is a CentOS repo and is not needed on Ubuntu.
+
+## 1. Install the build tools and Apache
+
+```bash
+sudo apt-get update
+sudo apt-get install -y autoconf gcc libc6 make wget unzip \
+  apache2 php libapache2-mod-php libgd-dev openssl libssl-dev
+```
+
+Check that the compiler is installed:
+
+```bash
+gcc --version
+```
+
+> If the terminal splits a long `apt-get install` line when you paste it, only the last part runs (here, only `openssl libssl-dev` got installed).
+> Step 2 then fails with `configure: error: no acceptable C compiler found in $PATH`.
+> Run the install again and check `gcc --version` before you continue.
+
+## 2. Download and compile Nagios Core
+
+```bash
+cd /tmp
+wget -O nagioscore.tar.gz https://github.com/NagiosEnterprises/nagioscore/archive/nagios-4.5.14.tar.gz
+tar xzf nagioscore.tar.gz
+cd /tmp/nagioscore-nagios-4.5.14/
+sudo ./configure --with-httpd-conf=/etc/apache2/sites-enabled
+sudo make all
+```
+
+`configure` should end with `*** Configuration summary for nagios 4.5.14 ***`.
+
+## 3. Create the nagios user and group
+
+`make install-groups-users` creates the `nagios` user and group. Add Apache's user to the group so the web interface can send commands to Nagios:
+
+```bash
+sudo make install-groups-users
+sudo usermod -a -G nagios www-data
+id www-data
+```
+
+Expected: `nagios` appears in the `groups=` list.
+
+> On Ubuntu, the Apache user is `www-data`. CentOS guides use `apache`, which does not exist here.
+>
+> Older guides also create a `nagcmd` group (`groupadd nagcmd`, `usermod -a -G nagcmd ...`). Nagios 4 does not need it:
+> `make install-commandmode` gives the `nagios` group access to the command file. An existing `nagcmd` group does no harm.
+
+## 4. Install Nagios and the web interface
+
+```bash
+sudo make install
+sudo make install-daemoninit
+sudo make install-commandmode
+sudo make install-config
+sudo make install-webconf
+sudo a2enmod rewrite cgi
+```
+
+> The Nagios web interface runs as CGI scripts, and Apache on Ubuntu ships with CGI disabled. Do not skip `a2enmod cgi`.
+
+## 5. Create the web login user
+
+```bash
+sudo htpasswd -c /usr/local/nagios/etc/htpasswd.users nagiosadmin
+```
+
+Enter a password when asked. You log in to the web interface with it.
+
+> `-c` creates the file. Use it only the first time: running it again overwrites the file and deletes the existing users.
+> To add more users later, leave out `-c`.
+
+## 6. Install Nagios Plugins
+
+The plugins are the `check_*` programs (ping, disk, HTTP, ...) that Nagios runs.
+
+```bash
+sudo apt-get install -y gcc libc6 make libssl-dev wget bc gawk dc build-essential \
+  snmp libnet-snmp-perl gettext automake autopoint
+cd /tmp
+wget -O nagios-plugins.tar.gz https://github.com/nagios-plugins/nagios-plugins/archive/release-2.5.tar.gz
+tar zxf nagios-plugins.tar.gz
+cd /tmp/nagios-plugins-release-2.5/
+sudo ./tools/setup
+sudo ./configure
+sudo make
+sudo make install
+```
+
+Check that the plugins are installed:
+
+```bash
+ls /usr/local/nagios/libexec
+```
+
+Expected: a list of `check_*` files.
+
+> Without the plugins, Nagios starts and the web interface works, but every check fails with
+> `execvp(/usr/local/nagios/libexec/check_ping, ...) failed. errno is 2: No such file or directory`.
+>
+> Do not create plugin files by hand (for example with `touch check_ping`). An empty file is not executable, so the host shows
+> `DOWN` with `Return code of 13 for host 'localhost' was out of bounds` (13 means "permission denied").
+> Delete the file (`sudo rm -f /usr/local/nagios/libexec/check_ping`) and run the steps above.
+
+## 7. Start the services
+
+```bash
+sudo systemctl restart apache2
+sudo systemctl enable --now nagios
+sudo systemctl status nagios
+```
+
+If `systemctl start nagios` fails and `systemctl status nagios` only shows
+`One or more problems was encountered while processing the config files...`, run the config check. Its output names the file and line of every error:
+
+```bash
+sudo /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+```
+
+Expected: `Total Warnings: 0` and `Total Errors: 0`.
+
+## 8. Test the setup
+
+On `nagios01`, confirm Apache serves Nagios:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost/nagios/
+```
+
+Expected: `401`. Apache asks for the Nagios login, so the web interface is installed.
+
+From your computer, open `http://192.168.56.16/nagios` (or `http://nagios01/nagios`) and log in as `nagiosadmin`.
+Under **Services**, the `localhost` checks should turn green (`OK`) within a few minutes.
+
+> The `ubuntu/jammy64` box has no swap, so the `localhost` **Swap Usage** check shows `CRITICAL` with
+> `SWAP CRITICAL - 0% free (0 MB out of 0 MB) - Swap is either disabled, not present, or of zero size`.
+> Add a 1 GB swap file (it also helps this 1 GB RAM VM):
+>
+> ```bash
+> sudo fallocate -l 1G /swapfile
+> sudo chmod 600 /swapfile
+> sudo mkswap /swapfile
+> sudo swapon /swapfile
+> echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+> free -m
+> ```
+>
+> Expected: `Swap:` shows about `1023` total. The check turns `OK` at its next run.
+
+> ufw is inactive on this box, so port `80` is open. If you enable ufw later, run `sudo ufw allow OpenSSH` and `sudo ufw allow Apache` first,
+> or you will lose your `vagrant ssh` session and the web interface.
+
+## 9. Monitor rmq01
+
+The `config.vm.define "rmq01"` block in the Vagrantfile only creates the VM. Nagios needs its own host definition for it.
+
+Enable the `servers` config folder:
+
+```bash
+sudo sed -i 's|^#cfg_dir=/usr/local/nagios/etc/servers|cfg_dir=/usr/local/nagios/etc/servers|' /usr/local/nagios/etc/nagios.cfg
+sudo mkdir -p /usr/local/nagios/etc/servers
+```
+
+Create the host file:
+
+```bash
+sudo vim /usr/local/nagios/etc/servers/rmq01.cfg
+```
+
+Content:
+
+```
+define host {
+    use                     linux-server
+    host_name               rmq01
+    alias                   RabbitMQ server
+    address                 192.168.56.13
+}
+
+define service {
+    use                     generic-service
+    host_name               rmq01
+    service_description     PING
+    check_command           check_ping!100.0,20%!500.0,60%
+}
+
+define service {
+    use                     generic-service
+    host_name               rmq01
+    service_description     SSH
+    check_command           check_ssh
+}
+
+define service {
+    use                     generic-service
+    host_name               rmq01
+    service_description     RabbitMQ port 5672
+    check_command           check_tcp!5672
+}
+```
+
+Check the config, then restart Nagios:
+
+```bash
+sudo /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+sudo systemctl restart nagios
+```
+
+Expected: `Checked 2 hosts`, `Total Errors: 0`. Within a few minutes, `rmq01` shows `UP` and its three services show `OK`.
+
+> Nagios only reads files listed in `nagios.cfg` with `cfg_file=`, or files inside a folder listed with `cfg_dir=`.
+> A host file saved anywhere else (for example `/usr/local/nagios/etc/objects/hosts.cfg`) is ignored without any error:
+> `nagios -v` still says `Checked 1 hosts` and the host never appears in the web interface.
+> Either move the file into `servers/`, or register it:
+>
+> ```bash
+> echo "cfg_file=/usr/local/nagios/etc/objects/hosts.cfg" | sudo tee -a /usr/local/nagios/etc/nagios.cfg
+> ```
+>
+> Do one or the other, not both. If the same host is defined in two files that Nagios reads (for example `servers/rmq01.cfg`
+> and a registered `objects/hosts.cfg`), Nagios refuses to start and `nagios -v` shows:
+>
+> ```
+> Warning: Duplicate definition found for host 'rmq01' (config file '/usr/local/nagios/etc/objects/hosts.cfg', starting on line 1)
+> Error: Could not add object property in file '/usr/local/nagios/etc/objects/hosts.cfg' on line 3.
+> Error: Invalid max_check_attempts value for host 'localhost'
+> ```
+>
+> The `localhost` error is a side effect of the duplicate; `localhost.cfg` is fine. Find every file that mentions the host:
+>
+> ```bash
+> sudo grep -rln "host_name *rmq01" /usr/local/nagios/etc/
+> ```
+>
+> Keep one file, then delete the other (or remove its `cfg_file=` line from `nagios.cfg`), run `nagios -v` and restart Nagios.
+
+> The checks run from `nagios01`, so the firewall on `rmq01` must allow them. firewalld allows ping and SSH by default, and port `5672` was opened in the RabbitMQ setup.
+>
+> To test a check by hand before adding it:
+>
+> ```bash
+> /usr/local/nagios/libexec/check_tcp -H 192.168.56.13 -p 5672
+> ```
+>
+> Expected: `TCP OK`.
+
+Other VMs follow the same pattern with their own file and port: `db01` (`3306`), `mc01` (`11211`), `app01` (`8080`), `web01` (`80`).
