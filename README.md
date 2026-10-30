@@ -779,3 +779,355 @@ Expected: `Checked 2 hosts`, `Total Errors: 0`. Within a few minutes, `rmq01` sh
 > Expected: `TCP OK`.
 
 Other VMs follow the same pattern with their own file and port: `db01` (`3306`), `mc01` (`11211`), `app01` (`8080`), `web01` (`80`).
+
+# Zabbix setup (zabbix01, Ubuntu 22.04)
+
+Zabbix 7.0 LTS (supported until 2029). The server and web interface run on `zabbix01`;
+each monitored VM runs a Zabbix agent that the server polls on port `10050`.
+
+| Item | Value |
+|------|-------|
+| Server VM | `zabbix01` (`192.168.56.17`) |
+| Web interface | http://192.168.56.17/zabbix |
+| Web login | `Admin` / `zabbix` (capital A; change it after the first login) |
+| Database | MySQL on `zabbix01`, database `zabbix`, user `zabbix` / `zabbix123` |
+
+## Part A: Install the Zabbix server
+
+```bash
+vagrant ssh zabbix01
+```
+
+### 1. Add the Zabbix 7.0 repository
+
+```bash
+cd /tmp
+wget https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_7.0+ubuntu22.04_all.deb
+sudo dpkg -i zabbix-release_latest_7.0+ubuntu22.04_all.deb
+sudo apt update
+```
+
+> Do not skip `sudo apt update`. Without it apt does not know the new repository and step 2 fails with
+> `E: Unable to locate package zabbix-apache-conf` (and `zabbix-sql-scripts`, `zabbix-get`).
+> Check that apt sees Zabbix 7.0, not Ubuntu's old 5.0:
+>
+> ```bash
+> apt-cache policy zabbix-server-mysql
+> ```
+>
+> `Candidate:` must be `1:7.0.x` from `repo.zabbix.com`.
+
+### 2. Install MySQL, the Zabbix server, web interface and agent
+
+```bash
+sudo apt install -y mysql-server
+sudo apt install -y zabbix-server-mysql zabbix-frontend-php zabbix-apache-conf zabbix-sql-scripts zabbix-agent zabbix-get
+sudo systemctl enable --now mysql
+```
+
+`zabbix-get` is a test tool: it asks an agent for a value from the command line (used in Part B).
+
+### 3. Create the database and user
+
+```bash
+sudo mysql
+```
+
+```sql
+CREATE DATABASE zabbix CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+CREATE USER 'zabbix'@'localhost' IDENTIFIED BY 'zabbix123';
+GRANT ALL PRIVILEGES ON zabbix.* TO 'zabbix'@'localhost';
+SET GLOBAL log_bin_trust_function_creators = 1;
+EXIT;
+```
+
+### 4. Load the Zabbix tables
+
+This takes 1–2 minutes and prints nothing while it runs.
+
+```bash
+zcat /usr/share/zabbix-sql-scripts/mysql/server.sql.gz | mysql --default-character-set=utf8mb4 -uzabbix -pzabbix123 zabbix
+sudo mysql -e "SET GLOBAL log_bin_trust_function_creators = 0;"
+sudo mysql zabbix -e "SHOW TABLES;" | wc -l
+```
+
+Expected: about 200 tables.
+
+### 5. Give the server the database password
+
+```bash
+echo "DBPassword=zabbix123" | sudo tee -a /etc/zabbix/zabbix_server.conf
+grep -E "^DB(Name|User|Password)=" /etc/zabbix/zabbix_server.conf
+```
+
+### 6. Start the services
+
+```bash
+sudo systemctl restart zabbix-server zabbix-agent apache2
+sudo systemctl enable zabbix-server zabbix-agent apache2
+sudo systemctl status zabbix-server --no-pager
+```
+
+`ufw` is inactive on `zabbix01`, so no firewall change is needed here.
+
+### 7. Finish the setup in the browser
+
+Open http://192.168.56.17/zabbix and complete the wizard:
+
+| Screen | Value |
+|--------|-------|
+| Check of pre-requisites | Every row OK |
+| Database type | MySQL |
+| Database host / port | `localhost` / `0` (default) |
+| Database name / user / password | `zabbix` / `zabbix` / `zabbix123` |
+| Zabbix server name | `zabbix01` |
+| Default time zone | Your time zone |
+
+Log in as `Admin` / `zabbix`, then change the password in **User settings → Profile**.
+
+### 8. Test the server
+
+```bash
+sudo ss -tlnp | grep -E ":80 |:10051 |:10050 "
+sudo tail -20 /var/log/zabbix/zabbix_server.log
+```
+
+Expected: ports `80` (Apache), `10051` (Zabbix server), `10050` (agent), and no `cannot connect to database` in the log.
+
+## Part B: Monitor app01 with the Zabbix agent
+
+The same steps work for `db01`, `mc01` and `rmq01` (see the table at the end of this part).
+
+### 1. Stop EPEL from providing Zabbix
+
+EPEL has its own, older Zabbix packages. Without this, `dnf` may install EPEL's agent instead of 7.0
+(the same kind of conflict as Erlang on `rmq01`).
+
+```bash
+vagrant ssh app01
+sudo sed -i '/^\[epel\]$/a excludepkgs=zabbix*' /etc/yum.repos.d/epel.repo
+grep -A1 '^\[epel\]$' /etc/yum.repos.d/epel.repo
+```
+
+> On `rmq01`, which already has `excludepkgs=erlang*`, extend that line instead of adding a second one:
+>
+> ```bash
+> sudo sed -i 's/^excludepkgs=erlang\*$/excludepkgs=erlang*,zabbix*/' /etc/yum.repos.d/epel.repo
+> ```
+
+### 2. Install the agent
+
+```bash
+sudo rpm -Uvh https://repo.zabbix.com/zabbix/7.0/centos/9/x86_64/zabbix-release-latest-7.0.el9.noarch.rpm
+sudo dnf clean all
+sudo dnf install -y zabbix-agent
+dnf info --installed zabbix-agent | grep -E "^(Version|From repo)"
+```
+
+Expected: `Version : 7.0.x` and `From repo : zabbix` (not `epel`).
+
+### 3. Point the agent at zabbix01
+
+```bash
+sudo sed -i "s/^Server=127.0.0.1/Server=192.168.56.17/; s/^ServerActive=127.0.0.1/ServerActive=192.168.56.17/; s/^Hostname=Zabbix server/Hostname=$(hostname -s)/" /etc/zabbix/zabbix_agentd.conf
+sudo grep -E "^(Server|ServerActive|Hostname)=" /etc/zabbix/zabbix_agentd.conf
+```
+
+Expected on `app01`:
+
+```
+Server=192.168.56.17
+ServerActive=192.168.56.17
+Hostname=app01
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `Server` | Which IP may ask this agent for data. Requests from any other IP are rejected. |
+| `ServerActive` | Where the agent sends data it collects on its own. |
+| `Hostname` | Must match the host name in the web interface exactly (case-sensitive). |
+
+### 4. Start the agent
+
+```bash
+sudo systemctl enable --now zabbix-agent
+sudo systemctl status zabbix-agent --no-pager
+sudo ss -tlnp | grep 10050
+```
+
+Expected: `active (running)` and `0.0.0.0:10050`.
+
+> Do not skip this step. With the agent stopped, the test in step 6 fails with
+> `cannot connect to [[192.168.56.12]:10050]: connection error (POLLERR,POLLHUP)`, even if the firewall is open.
+> After any later change to `zabbix_agentd.conf`, run `sudo systemctl restart zabbix-agent`.
+
+### 5. Open port 10050 in the firewall
+
+```bash
+sudo firewall-cmd --zone=public --add-port=10050/tcp --permanent
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
+
+### 6. Test the agent from zabbix01
+
+```bash
+vagrant ssh zabbix01
+zabbix_get -s 192.168.56.12 -k agent.ping
+zabbix_get -s 192.168.56.12 -k agent.hostname
+zabbix_get -s 192.168.56.12 -k system.uname
+```
+
+Expected: `1`, `app01`, and a `Linux app01 ...` line. Do not continue until this works.
+
+### 7. Add app01 in the web interface
+
+1. **Data collection → Hosts → Create host** (top right).
+2. **Host name:** `app01` (same as `Hostname=` in step 3).
+3. **Templates:** **Select** → template group **Templates/Operating systems** → tick **Linux by Zabbix agent** → **Select**.
+4. **Host groups:** `Linux servers`.
+5. **Interfaces:** **Add → Agent**, IP `192.168.56.12`, **Connect to** IP, port `10050`.
+6. Click **Add**.
+
+Within about a minute the **ZBX** icon in the **Availability** column turns green, and
+**Monitoring → Latest data** (filter host `app01`) shows CPU, memory, disk and network values.
+
+> Until the host exists in the web interface, the agent log shows `host [app01] not found`. That is expected.
+
+### Other VMs
+
+Repeat steps 1–7 with these values:
+
+| VM | Step 1 | IP (steps 6 and 7) | Host name |
+|----|--------|--------------------|-----------|
+| db01 | add new line | 192.168.56.15 | `db01` |
+| mc01 | add new line | 192.168.56.14 | `mc01` |
+| rmq01 | extend existing line | 192.168.56.13 | `rmq01` |
+
+Check all agents at once from `zabbix01`:
+
+```bash
+for ip in 192.168.56.12 192.168.56.15 192.168.56.14 192.168.56.13; do
+  printf "%-15s " "$ip"; zabbix_get -s "$ip" -k agent.hostname
+done
+```
+
+## Part C: Monitor Tomcat and the vprofile app on app01
+
+The Linux template watches the VM (CPU, memory, disk), not Tomcat. These two checks watch the application itself.
+
+### 1. Tomcat process check (agent item)
+
+Test it first from `zabbix01`:
+
+```bash
+zabbix_get -s 192.168.56.12 -k "proc.num[java,tomcat]"
+```
+
+Expected: `1` (one Java process owned by the `tomcat` user).
+
+In the web interface: **Data collection → Hosts → app01 → Items → Create item**:
+
+| Field | Value |
+|-------|-------|
+| Name | `Tomcat: Java processes` |
+| Type | Zabbix agent |
+| Key | `proc.num[java,tomcat]` |
+| Type of information | Numeric (unsigned) |
+| Update interval | `1m` |
+
+Click **Test → Get value and test** (should return `1`), then **Add**.
+
+Then **app01 → Triggers → Create trigger**:
+
+| Field | Value |
+|-------|-------|
+| Name | `Tomcat is not running on app01` |
+| Severity | High |
+| Expression | `last(/app01/proc.num[java,tomcat])=0` |
+
+### 2. vprofile login page check (web scenario)
+
+The Zabbix server opens the login page like a browser would and checks the answer.
+
+**Data collection → Hosts → app01 → Web → Create web scenario**:
+
+- **Scenario** tab: **Name** `vprofile login page`, **Update interval** `1m`.
+- **Steps** tab → **Add**:
+
+  | Field | Value |
+  |-------|-------|
+  | Name | `Login page` |
+  | URL | `http://192.168.56.12:8080/` |
+  | Required string | `Login` |
+  | Required status codes | `200` |
+
+Click **Add** (step), then **Add** (scenario).
+
+Then **app01 → Triggers → Create trigger**:
+
+| Field | Value |
+|-------|-------|
+| Name | `vprofile login page is down` |
+| Severity | High |
+| Expression | `last(/app01/web.test.fail[vprofile login page])<>0` |
+
+Check the result in **Monitoring → Web**: the scenario should show status **OK** and a response time.
+
+> Why not an agent check on port 8080 (`net.tcp.service[http,127.0.0.1,8080]`)? On CentOS, SELinux blocks the
+> agent from connecting to other ports. The check returns `0` even with Tomcat up, and `/var/log/audit/audit.log` shows
+> `denied { name_connect } ... comm="zabbix_agentd" dest=8080`. The `zabbix_can_network` boolean does not cover
+> the agent. The web scenario runs on `zabbix01` (Ubuntu, no SELinux) and tests what users actually see.
+
+## Part D: vprofile dashboard
+
+**Dashboards → All dashboards → Create dashboard**, **Name** `vprofile app01`, **Apply**.
+Then click **Add widget** for each row below, and finish with **Save changes**.
+
+| Widget type | Settings | Shows |
+|-------------|----------|-------|
+| Problems | **Hosts:** `app01` | Open alerts for app01 |
+| Item value | **Item:** `app01: Tomcat: Java processes` | `1` while Tomcat runs |
+| Item value | **Item:** `app01: Response time for step "Login page" of scenario "vprofile login page".` | Login page response time |
+| Web monitoring | **Host groups:** `Linux servers` | Web scenario status (OK / Failed) |
+| Graph (classic) | **Source:** Graph, **Graph:** `app01: Linux: CPU utilization` | CPU graph |
+| Graph (classic) | **Source:** Graph, **Graph:** `app01: Linux: Memory utilization` | Memory graph |
+
+## Check that everything works
+
+| Level | Where | Command / place | Expected |
+|-------|-------|-----------------|----------|
+| 1 | app01 | `sudo systemctl status zabbix-agent` | `active (running)` |
+| 2 | zabbix01 | `zabbix_get -s 192.168.56.12 -k agent.ping` | `1` |
+| 3 | Web | **Data collection → Hosts** | ZBX icon green |
+| 4 | Web | **Monitoring → Latest data**, host `app01` | Values with a recent **Last check** |
+| 5 | Web | **Monitoring → Web** | `vprofile login page`: OK |
+
+Then prove the alerts work by breaking things on purpose:
+
+```bash
+# on app01
+sudo systemctl stop tomcat
+```
+
+Within 1–2 minutes **Monitoring → Problems** and the dashboard show `Tomcat is not running on app01`
+and `vprofile login page is down`. Start Tomcat again (`sudo systemctl start tomcat`) and both turn **RESOLVED**.
+
+The same works for the agent: `sudo systemctl stop zabbix-agent` makes the ZBX icon red and raises
+`Zabbix agent is not available` after about 3 minutes.
+
+## Troubleshooting
+
+Logs: agent `/var/log/zabbix/zabbix_agentd.log` (on the monitored VM), server `/var/log/zabbix/zabbix_server.log`
+and web interface `/var/log/apache2/error.log` (on `zabbix01`).
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `E: Unable to locate package zabbix-...` | `apt update` skipped after adding the repo | `sudo apt update`, then install again |
+| "Zabbix server is not running" in the web interface | Wrong `DBPassword` | Part A step 5, then `sudo systemctl restart zabbix-server` |
+| `zabbix_get`: `connection error (POLLERR,POLLHUP)` or `Connection refused` | Agent not running | Part B step 4 |
+| `zabbix_get`: `No route to host` | Port 10050 blocked | Part B step 5 |
+| Agent log: `connection from "192.168.56.17" rejected, allowed hosts: "127.0.0.1"` | `Server=` not changed or agent not restarted | Part B step 3, then `sudo systemctl restart zabbix-agent` |
+| Agent log: `host [app01] not found` | Host missing in the web interface or name mismatch | Part B step 7; name must match `Hostname=` |
+| `dnf info` shows `From repo : epel` | EPEL's agent installed | Part B step 1, `sudo dnf remove -y zabbix-agent`, then step 2 |
+| Agent port check returns `0` while the service is up | SELinux blocks the agent | Use a web scenario (Part C) instead |
