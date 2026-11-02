@@ -93,7 +93,7 @@
                                            </div>
                                            <!-- Logout form -->
                                           <!-- Logout Form -->
-                                          <form id="logoutForm" method="POST" action="${contextPath}">
+                                          <form id="logoutForm" method="POST" action="${contextPath}/logout">
                                               <input type="hidden" name="${_csrf.parameterName}" value="${_csrf.token}"/>
                                               <button type="submit" class="btn btn-default btn-sm pull-right">
                                                   <i class="fa fa-power-off" aria-hidden="true"></i> Sign Out

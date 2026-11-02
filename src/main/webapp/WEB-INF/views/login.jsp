@@ -99,6 +99,12 @@
                     </div>
                 </c:if>
 
+                <c:if test="${not empty message}">
+                    <div class="alert alert-success">
+                        <c:out value="${message}"/>
+                    </div>
+                </c:if>
+
                 <div class="wrap-input100 validate-input m-b-23" data-validate="Username is required">
                     <span class="label-input100">Username</span>
                     <input class="input100" type="text" name="username" placeholder="Type your username" required autofocus>
