@@ -1,258 +1,221 @@
-# vprofile services setup
+# vprofile on Docker
 
-Setup order: MySQL → Memcached → RabbitMQ → Tomcat → Nginx.
+This branch runs the vprofile Java web app as five containers with Docker Compose,
+instead of the five VMs used in the `vagrant/` and `ansible/` setups.
 
-# MySQL setup (db01, Ubuntu)
+```
+Browser ──► vproweb (Nginx :80) ──► vproapp (Tomcat :8080) ──┬──► vprodb      (MySQL :3306)
+                                                             ├──► vprocache01 (Memcached :11211)
+                                                             └──► vpromq01    (RabbitMQ :5672)
+```
 
-The application connects to MySQL using these settings from
-`src/main/resources/application.properties`:
+## Services
 
-| Setting  | Value                            |
-|----------|----------------------------------|
-| Host     | `db01`                           |
-| Port     | `3306`                           |
-| Database | `accounts`                       |
-| User     | `admin`                          |
-| Password | `admin123`                       |
+| Service       | Image                         | Built from            | Port  | Role                       |
+|---------------|-------------------------------|-----------------------|-------|----------------------------|
+| `vprodb`      | `vprocontainers/vprofiledb`   | `docker/db/Dockerfile`  | 3306  | MySQL 8.0.33, `accounts` DB  |
+| `vprocache01` | `memcached` (Docker Hub)      | –                     | 11211 | Cache for DB queries          |
+| `vpromq01`    | `rabbitmq` (Docker Hub)       | –                     | 5672  | Message broker             |
+| `vproapp`     | `vprocontainers/vprofileapp`  | `docker/app/Dockerfile` | 8080  | Tomcat 10 running the WAR  |
+| `vproweb`     | `vprocontainers/vprofileweb`  | `docker/web/Dockerfile` | 80    | Nginx reverse proxy        |
 
-The steps below must produce exactly this database, user and password.
+The app finds the other containers by **service name** (`vprodb`, `vprocache01`,
+`vpromq01`), so don't rename these services in `docker-compose.yaml`.
 
-## 1. Install MySQL
+## Prerequisites
+
+- Docker Engine 20.10+ with the Compose plugin (`docker compose version`)
+- About 3 GB free disk space for images and the Maven build
+- Free host ports: `80`, `8080`, `3306`, `5672`, `11211`
+
+## Quick start
 
 ```bash
-sudo apt update
-sudo apt install mysql-server -y
-sudo systemctl start mysql
-sudo systemctl enable mysql
-sudo systemctl status mysql
-```
-
-## 2. Set the root password
-
-On Ubuntu, the MySQL `root` user logs in with `auth_socket` (no password, only via `sudo`).
-Switch it to password login first, otherwise `mysql_secure_installation` cannot set a password:
-
-```bash
-sudo mysql
-```
-
-```sql
-ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '123456789';
-FLUSH PRIVILEGES;
-EXIT;
-```
-
-## 3. Secure the installation
-
-```bash
-sudo mysql_secure_installation
-```
-
-Answers:
-
-- Enter password for root: `123456789`
-- VALIDATE PASSWORD component: `y`, policy level `0` (LOW). MEDIUM/STRONG will reject `admin123`
-- Change the password for root: `n`
-- Remove anonymous users: `y`
-- Disallow root login remotely: `y`
-- Remove test database: `y`
-- Reload privilege tables now: `y`
-
-From now on, log in with:
-
-```bash
-mysql -u root -p
-```
-
-## 4. Create the database and application user
-
-```bash
-mysql -u root -p
-```
-
-```sql
-CREATE DATABASE accounts;
-
-CREATE USER 'admin'@'localhost' IDENTIFIED BY 'admin123';
-CREATE USER 'admin'@'%' IDENTIFIED BY 'admin123';
-
-GRANT ALL PRIVILEGES ON accounts.* TO 'admin'@'localhost';
-GRANT ALL PRIVILEGES ON accounts.* TO 'admin'@'%';
-
-FLUSH PRIVILEGES;
-EXIT;
-```
-
-> MySQL 8 no longer supports `GRANT ... IDENTIFIED BY`. Create the user first, then grant.
-
-## 5. Import the initial data
-
-```bash
-cd /tmp/
-git clone -b manual-vprofile-with-vagrant https://github.com/Ahmed363-Essam/vprofile-multi-vms.git
+git clone -b docker https://github.com/Ahmed363-Essam/vprofile-multi-vms.git
 cd vprofile-multi-vms
-mysql -u root -p accounts < src/main/resources/db_backup.sql
+
+docker compose build      # build db, app and web images
+docker compose up -d      # start all containers in the background
+docker compose ps         # all five should be "running"
 ```
 
-Verify:
+Open **http://localhost** (through Nginx) or **http://localhost:8080** (Tomcat directly).
+
+Login: `admin_vp` / `admin_vp` (seeded by `docker/db/db_backup.sql`).
+
+> The first start can take a minute. MySQL runs `db_backup.sql` on its first boot,
+> and the app may try to connect before MySQL is ready. If the login page shows a DB
+> error, wait a moment and run `docker compose restart vproapp`.
+
+## Images in detail
+
+### Database: `docker/db/Dockerfile`
+
+```dockerfile
+FROM mysql:8.0.33
+ENV MYSQL_ROOT_PASSWORD="vprodbpass"
+ENV MYSQL_DATABASE="accounts"
+ADD db_backup.sql docker-entrypoint-initdb.d/db_backup.sql
+EXPOSE 3306
+```
+
+- Creates the `accounts` database and loads `db_backup.sql` (tables `user`, `role`,
+  `user_role` plus sample users).
+- Scripts in `docker-entrypoint-initdb.d` run **only when the data volume is empty**.
+  To re-seed the database, remove the volume (see [Reset everything](#reset-everything)).
+- Data is kept in the named volume `vprodbdata`.
+
+| Setting  | Value        |
+|----------|--------------|
+| Host     | `vprodb`     |
+| Database | `accounts`   |
+| User     | `root`       |
+| Password | `vprodbpass` |
+
+### Application: `docker/app/Dockerfile`
+
+This is a multi-stage build:
+
+1. **Build stage** (`maven:3.9.9-eclipse-temurin-21-jammy`): clones
+   `https://github.com/hkhcoder/vprofile-project.git`, checks out its `docker`
+   branch, and runs `mvn install` to produce `vprofile-v2.war`.
+2. **Run stage** (`tomcat:10-jdk21`): copies the WAR to
+   `/usr/local/tomcat/webapps/ROOT.war` so the app is served at `/`.
+
+> **Note:** the image builds the source from the upstream GitHub repo, **not**
+> from the local `src/` folder. Local code changes won't show up in the container
+> unless you change the Dockerfile to build from this repo (see below).
+
+The app reads its connection settings from `src/main/resources/application.properties`
+in the WAR. For the containers to talk to each other, the hostnames there must match
+the compose service names:
+
+```properties
+jdbc.url=jdbc:mysql://vprodb:3306/accounts?useUnicode=true&characterEncoding=UTF-8&zeroDateTimeBehavior=convertToNull
+jdbc.username=root
+jdbc.password=vprodbpass
+
+memcached.active.host=vprocache01
+memcached.active.port=11211
+memcached.standBy.host=vprocache01
+memcached.standBy.port=11211
+
+rabbitmq.address=vpromq01
+rabbitmq.port=5672
+rabbitmq.username=guest
+rabbitmq.password=guest
+```
+
+The local `application.properties` in this repo still uses the VM hostnames
+(`db01`, `mc01`, `rmq01`). Update it as shown above if you switch to building from
+local source.
+
+#### Building from local source (optional)
+
+Run the build with the repo root as the build context:
+
+```dockerfile
+FROM maven:3.9.9-eclipse-temurin-21-jammy AS BUILD_IMAGE
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN mvn install -DskipTests
+
+FROM tomcat:10-jdk21
+RUN rm -rf /usr/local/tomcat/webapps/*
+COPY --from=BUILD_IMAGE /app/target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war
+EXPOSE 8080
+CMD ["catalina.sh", "run"]
+```
+
+```yaml
+  vproapp:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+```
+
+### Web: `docker/web/Dockerfile`
+
+```dockerfile
+FROM nginx
+COPY default.conf /etc/nginx/conf.d/default.conf
+```
+
+`default.conf` forwards all traffic on port 80 to the app container:
+
+```nginx
+upstream vproapp {
+  server vproapp:8080;
+}
+server {
+  listen 80;
+  location / {
+    proxy_pass http://vproapp;
+  }
+}
+```
+
+## Common commands
 
 ```bash
-mysql -u root -p accounts -e "SHOW TABLES;"
+docker compose up -d --build        # rebuild images and start
+docker compose ps                   # container status
+docker compose logs -f vproapp      # follow Tomcat logs
+docker compose logs vprodb          # MySQL init logs
+docker compose restart vproapp      # restart a single service
+docker compose stop                 # stop without removing
+docker compose down                 # stop and remove containers (volumes are kept)
 ```
 
-You should see the `role`, `user` and `user_role` tables.
-
-## 6. Allow remote connections
-
-The Tomcat server (`app01`) connects over the network, but by default MySQL only listens on `127.0.0.1`.
-Edit the MySQL config:
+Check each service:
 
 ```bash
-sudo vim /etc/mysql/mysql.conf.d/mysqld.cnf
+# MySQL: list tables in accounts
+docker compose exec vprodb mysql -uroot -pvprodbpass accounts -e "SHOW TABLES;"
+
+# Memcached: should print "STAT ..." lines
+docker compose exec vproapp bash -c "exec 3<>/dev/tcp/vprocache01/11211; echo stats >&3; head -5 <&3"
+
+# RabbitMQ
+docker compose exec vpromq01 rabbitmq-diagnostics status
+
+# App through Nginx
+curl -I http://localhost
 ```
 
-Change:
-
-```ini
-bind-address = 127.0.0.1
-mysqlx-bind-address = 127.0.0.1
-```
-
-to:
-
-```ini
-bind-address = 0.0.0.0
-mysqlx-bind-address = 0.0.0.0
-```
-
-Or do it in one command:
+## Reset everything
 
 ```bash
-sudo sed -i 's/^bind-address.*/bind-address = 0.0.0.0/; s/^mysqlx-bind-address.*/mysqlx-bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+docker compose down -v      # -v also deletes vprodbdata and vproappdata
+docker compose up -d --build
 ```
 
-Restart MySQL:
+## Pushing images to Docker Hub (optional)
 
 ```bash
-sudo systemctl restart mysql
+docker login
+docker compose build
+docker push vprocontainers/vprofiledb
+docker push vprocontainers/vprofileapp
+docker push vprocontainers/vprofileweb
 ```
 
-## 7. Open port 3306 in the firewall
+Replace `vprocontainers` in `docker-compose.yaml` with your own Docker Hub username
+if you don't have push access to that namespace.
 
-```bash
-sudo ufw allow 3306/tcp
-sudo ufw allow OpenSSH
-sudo ufw enable
-sudo ufw status
-```
+## Troubleshooting
 
-> Allow OpenSSH before enabling ufw, or you will lose your `vagrant ssh` session.
+| Problem | Fix |
+|---------|-----|
+| `port is already allocated` | Another service is using 80/8080/3306. Stop it, or change the host side of the port mapping, e.g. `"8081:8080"`. |
+| Login page shows a DB / JDBC error | MySQL was still starting up. Run `docker compose restart vproapp`. |
+| Tables missing in `accounts` | The volume was created before the SQL file was added. Run `docker compose down -v` and start again. |
+| `502 Bad Gateway` from Nginx | Tomcat is still deploying the WAR. Check `docker compose logs -f vproapp`. |
+| Code changes not visible | The app image builds the upstream repo. See [Building from local source](#building-from-local-source-optional). |
 
-## 8. Test the setup
+## Other setups in this repo
 
-On the DB server, confirm MySQL is listening on all interfaces:
-
-```bash
-sudo ss -tlnp | grep 3306
-```
-
-Expected: `0.0.0.0:3306`.
-
-From another VM (for example `app01`), test the login as the application user:
-
-```bash
-mysql -h db01 -u admin -padmin123 accounts -e "SHOW TABLES;"
-```
-
-# Memcached setup (mc01, CentOS Stream 9)
-
-The application connects to Memcached using these settings from
-`src/main/resources/application.properties`:
-
-| Setting | Value   |
-|---------|---------|
-| Host    | `mc01`  |
-| Port    | `11211` |
-
-Log in to the VM:
-
-```bash
-vagrant ssh mc01
-```
-
-Check that `/etc/hosts` has entries for the other VMs (`db01`, `app01`, ...):
-
-```bash
-cat /etc/hosts
-```
-
-## 1. Install Memcached
-
-```bash
-sudo dnf update -y
-sudo dnf install epel-release -y
-sudo dnf install memcached -y
-sudo systemctl start memcached
-sudo systemctl enable memcached
-sudo systemctl status memcached
-```
-
-## 2. Configure Memcached
-
-```bash
-sudo vim /etc/sysconfig/memcached
-```
-
-Set:
-
-```ini
-PORT="11211"
-USER="memcached"
-MAXCONN="1024"
-CACHESIZE="64"
-OPTIONS="-l 0.0.0.0 -U 0"
-```
-
-- `-l 0.0.0.0`: listen on all interfaces. With the default `-l 127.0.0.1`, the Tomcat server (`app01`) cannot reach Memcached.
-- `-U 0`: disable UDP. The app only uses TCP, and an open UDP port can be abused for amplification attacks.
-
-Or do it in one command:
-
-```bash
-sudo sed -i 's/^OPTIONS=.*/OPTIONS="-l 0.0.0.0 -U 0"/' /etc/sysconfig/memcached
-```
-
-Restart Memcached:
-
-```bash
-sudo systemctl restart memcached
-```
-
-## 3. Open port 11211 in the firewall
-
-```bash
-sudo systemctl start firewalld
-sudo systemctl enable firewalld
-sudo firewall-cmd --zone=public --add-port=11211/tcp --permanent
-sudo firewall-cmd --reload
-sudo firewall-cmd --list-ports
-```
-
-## 4. Test the setup
-
-On `mc01`, confirm Memcached is listening on all interfaces:
-
-```bash
-sudo ss -tlnp | grep 11211
-```
-
-Expected: `0.0.0.0:11211`.
-
-From another VM (for example `app01`), check that the port is reachable:
-
-```bash
-sudo dnf install nmap-ncat -y
-echo stats | nc mc01 11211
-```
-
-You should see a list of `STAT ...` lines.
+- `vagrant/`: multi-VM setup with Vagrant
+- `ansible/`: provisioning with Ansible
+- `VprofileProjectSetupWindowsAndMacIntel.pdf`: manual VM setup guide
