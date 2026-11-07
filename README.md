@@ -17,10 +17,43 @@ Browser ──► vproweb (Nginx :80) ──► vproapp (Tomcat :8080) ──┬
 | `vprocache01` | `memcached` (Docker Hub)      | –                     | 11211 | Cache for DB queries          |
 | `vpromq01`    | `rabbitmq` (Docker Hub)       | –                     | 5672  | Message broker             |
 | `vproapp`     | `vprocontainers/vprofileapp`  | `docker/app/Dockerfile` | 8080  | Tomcat 10 running the WAR  |
-| `vproweb`     | `vprocontainers/vprofileweb`  | `docker/web/Dockerfile` | 80    | Nginx reverse proxy        |
+| `vproweb`     | `vprocontainers/vprofileweb`  | `docker/web/Dockerfile` | 80 → 8080 | Nginx reverse proxy    |
 
 The app finds the other containers by **service name** (`vprodb`, `vprocache01`,
 `vpromq01`), so don't rename these services in `docker-compose.yaml`.
+
+## Non-root containers
+
+Every container runs as a non-root user:
+
+| Service       | User (UID)          | How |
+|---------------|---------------------|-----|
+| `vprodb`      | `mysql` (999)       | `USER mysql` in `docker/db/Dockerfile` |
+| `vprocache01` | `memcache` (11211)  | `user: memcache` in `docker-compose.yaml` |
+| `vpromq01`    | `rabbitmq` (999)    | `user: rabbitmq` in `docker-compose.yaml` |
+| `vproapp`     | `tomcat` (1001)     | user created and `USER tomcat` in `docker/app/Dockerfile` |
+| `vproweb`     | `nginx` (101)       | `nginxinc/nginx-unprivileged` base image, `USER nginx` |
+
+A non-root user can't bind ports below 1024, so Nginx listens on **8080 inside the
+container**. Compose maps host port 80 to it (`"80:8080"`), so you still browse to
+`http://localhost`.
+
+Check it yourself:
+
+```bash
+for c in vprodb vproapp vproweb; do docker exec $c id; done
+docker compose exec vprocache01 id
+docker compose exec vpromq01 id
+```
+
+> **Upgrading from the old root images:** the app no longer uses a volume for
+> `webapps`. The WAR is built into the image and owned by `tomcat`. Recreate the
+> app container and delete the old root-owned volume once:
+>
+> ```bash
+> docker compose up -d --build --force-recreate vproapp
+> docker volume rm vprofile-multi-vms_vproappdata
+> ```
 
 ## Prerequisites
 
@@ -55,7 +88,8 @@ Login: `admin_vp` / `admin_vp` (seeded by `docker/db/db_backup.sql`).
 FROM mysql:8.0.33
 ENV MYSQL_ROOT_PASSWORD="vprodbpass"
 ENV MYSQL_DATABASE="accounts"
-ADD db_backup.sql docker-entrypoint-initdb.d/db_backup.sql
+COPY --chown=mysql:mysql db_backup.sql /docker-entrypoint-initdb.d/db_backup.sql
+USER mysql
 EXPOSE 3306
 ```
 
@@ -79,8 +113,9 @@ This is a multi-stage build:
 1. **Build stage** (`maven:3.9.9-eclipse-temurin-21-jammy`): clones
    `https://github.com/hkhcoder/vprofile-project.git`, checks out its `docker`
    branch, and runs `mvn install` to produce `vprofile-v2.war`.
-2. **Run stage** (`tomcat:10-jdk21`): copies the WAR to
-   `/usr/local/tomcat/webapps/ROOT.war` so the app is served at `/`.
+2. **Run stage** (`tomcat:10-jdk21`): creates a `tomcat` user (UID 1001), copies the
+   WAR to `/usr/local/tomcat/webapps/ROOT.war` so the app is served at `/`, gives
+   `tomcat` ownership of `/usr/local/tomcat`, and switches to it with `USER tomcat`.
 
 > **Note:** the image builds the source from the upstream GitHub repo, **not**
 > from the local `src/` folder. Local code changes won't show up in the container
@@ -122,8 +157,12 @@ COPY src ./src
 RUN mvn install -DskipTests
 
 FROM tomcat:10-jdk21
+RUN groupadd --system --gid 1001 tomcat && \
+    useradd --system --uid 1001 --gid tomcat --no-create-home --shell /usr/sbin/nologin tomcat
 RUN rm -rf /usr/local/tomcat/webapps/*
-COPY --from=BUILD_IMAGE /app/target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war
+COPY --from=BUILD_IMAGE --chown=tomcat:tomcat /app/target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war
+RUN chown -R tomcat:tomcat /usr/local/tomcat
+USER tomcat
 EXPOSE 8080
 CMD ["catalina.sh", "run"]
 ```
@@ -138,18 +177,21 @@ CMD ["catalina.sh", "run"]
 ### Web: `docker/web/Dockerfile`
 
 ```dockerfile
-FROM nginx
+FROM nginxinc/nginx-unprivileged:1.27
+RUN rm /etc/nginx/conf.d/default.conf
 COPY default.conf /etc/nginx/conf.d/default.conf
+USER nginx
+EXPOSE 8080
 ```
 
-`default.conf` forwards all traffic on port 80 to the app container:
+`default.conf` forwards all traffic on port 8080 to the app container:
 
 ```nginx
 upstream vproapp {
   server vproapp:8080;
 }
 server {
-  listen 80;
+  listen 8080;
   location / {
     proxy_pass http://vproapp;
   }
@@ -187,7 +229,7 @@ curl -I http://localhost
 ## Reset everything
 
 ```bash
-docker compose down -v      # -v also deletes vprodbdata and vproappdata
+docker compose down -v      # -v also deletes the vprodbdata volume (DB is re-seeded on next start)
 docker compose up -d --build
 ```
 
@@ -208,6 +250,7 @@ if you don't have push access to that namespace.
 
 | Problem | Fix |
 |---------|-----|
+| `Permission denied` in app or DB logs after upgrading | Old volumes are owned by root. Run `docker compose down -v` and start again. |
 | `port is already allocated` | Another service is using 80/8080/3306. Stop it, or change the host side of the port mapping, e.g. `"8081:8080"`. |
 | Login page shows a DB / JDBC error | MySQL was still starting up. Run `docker compose restart vproapp`. |
 | Tables missing in `accounts` | The volume was created before the SQL file was added. Run `docker compose down -v` and start again. |
