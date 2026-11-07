@@ -55,11 +55,56 @@ docker compose exec vpromq01 id
 > docker volume rm vprofile-multi-vms_vproappdata
 > ```
 
+## Credentials (Docker secrets)
+
+No password is stored in git, in the images, or in `docker-compose.yaml`.
+
+`./generate-secrets.sh` creates random 32-character passwords in `./secrets/`, which is
+listed in `.gitignore`. Compose mounts each file read-only at `/run/secrets/<name>`, only
+in the containers that need it:
+
+| Secret             | Used by             | Purpose |
+|--------------------|---------------------|---------|
+| `db_root_password` | `vprodb`            | MySQL `root` (admin only; the app never uses it) |
+| `db_password`      | `vprodb`, `vproapp` | MySQL user `vproapp`, with access to the `accounts` DB only |
+| `mq_password`      | `vpromq01`, `vproapp` | RabbitMQ user `vprouser` (the default `guest` user isn't created) |
+
+How each service reads them:
+
+- **MySQL:** the official image's `MYSQL_ROOT_PASSWORD_FILE` and `MYSQL_PASSWORD_FILE`.
+- **RabbitMQ:** the compose `entrypoint` reads the file into `RABBITMQ_DEFAULT_PASS`
+  before it starts the server.
+- **App:** `docker/app/entrypoint.sh` reads the files and exports `JDBC_PASSWORD` and
+  `RABBITMQ_PASSWORD`. Spring resolves `${jdbc.password}` from the `JDBC_PASSWORD`
+  environment variable first, so the values in `application.properties` inside
+  the WAR are overridden. Usernames are plain env vars (`JDBC_USERNAME`, `RABBITMQ_USERNAME`).
+
+Secrets never appear in `docker inspect`, `docker history` or the process list.
+
+> **Important:** MySQL and RabbitMQ create their users only when their data volume is
+> **empty**. When you switch from the old hard-coded passwords, or change a secret,
+> recreate the volumes:
+>
+> ```bash
+> docker compose down -v        # deletes DB and RabbitMQ data (DB is re-seeded)
+> docker compose up -d --build
+> ```
+
+Read a password when you need it:
+
+```bash
+cat secrets/db_root_password
+```
+
+The `secrets/` folder is `700` (only your user can open it). The files are `644`
+so the non-root users inside the containers can read them.
+
 ## Prerequisites
 
 - Docker Engine 20.10+ with the Compose plugin (`docker compose version`)
 - About 3 GB free disk space for images and the Maven build
-- Free host ports: `80`, `8080`, `3306`, `5672`, `11211`
+- `openssl` (used by `generate-secrets.sh`)
+- Free host port: `80`
 
 ## Quick start
 
@@ -67,12 +112,14 @@ docker compose exec vpromq01 id
 git clone -b docker https://github.com/Ahmed363-Essam/vprofile-multi-vms.git
 cd vprofile-multi-vms
 
+./generate-secrets.sh     # create random passwords in ./secrets/ (once)
 docker compose build      # build db, app and web images
 docker compose up -d      # start all containers in the background
 docker compose ps         # all five should be "running"
 ```
 
-Open **http://localhost** (through Nginx) or **http://localhost:8080** (Tomcat directly).
+Open **http://localhost**. Only Nginx is published to the host. Tomcat, MySQL, RabbitMQ
+and Memcached are reachable only inside the `vprofile-net` network.
 
 Login: `admin_vp` / `admin_vp` (seeded by `docker/db/db_backup.sql`).
 
@@ -86,8 +133,7 @@ Login: `admin_vp` / `admin_vp` (seeded by `docker/db/db_backup.sql`).
 
 ```dockerfile
 FROM mysql:8.0.33
-ENV MYSQL_ROOT_PASSWORD="vprodbpass"
-ENV MYSQL_DATABASE="accounts"
+ENV MYSQL_DATABASE="accounts"   # passwords come from Docker secrets
 COPY --chown=mysql:mysql db_backup.sql /docker-entrypoint-initdb.d/db_backup.sql
 USER mysql
 EXPOSE 3306
@@ -103,8 +149,8 @@ EXPOSE 3306
 |----------|--------------|
 | Host     | `vprodb`     |
 | Database | `accounts`   |
-| User     | `root`       |
-| Password | `vprodbpass` |
+| User     | `vproapp` (app), `root` (admin) |
+| Password | from `secrets/db_password` / `secrets/db_root_password` |
 
 ### Application: `docker/app/Dockerfile`
 
@@ -127,8 +173,8 @@ the compose service names:
 
 ```properties
 jdbc.url=jdbc:mysql://vprodb:3306/accounts?useUnicode=true&characterEncoding=UTF-8&zeroDateTimeBehavior=convertToNull
-jdbc.username=root
-jdbc.password=vprodbpass
+jdbc.username=root          # overridden by JDBC_USERNAME=vproapp
+jdbc.password=vprodbpass    # overridden by JDBC_PASSWORD from secrets
 
 memcached.active.host=vprocache01
 memcached.active.port=11211
@@ -137,8 +183,8 @@ memcached.standBy.port=11211
 
 rabbitmq.address=vpromq01
 rabbitmq.port=5672
-rabbitmq.username=guest
-rabbitmq.password=guest
+rabbitmq.username=guest     # overridden by RABBITMQ_USERNAME=vprouser
+rabbitmq.password=guest     # overridden by RABBITMQ_PASSWORD from secrets
 ```
 
 The local `application.properties` in this repo still uses the VM hostnames
@@ -214,7 +260,7 @@ Check each service:
 
 ```bash
 # MySQL: list tables in accounts
-docker compose exec vprodb mysql -uroot -pvprodbpass accounts -e "SHOW TABLES;"
+docker compose exec vprodb sh -c 'mysql -uroot -p"$(cat /run/secrets/db_root_password)" accounts -e "SHOW TABLES;"'
 
 # Memcached: should print "STAT ..." lines
 docker compose exec vproapp bash -c "exec 3<>/dev/tcp/vprocache01/11211; echo stats >&3; head -5 <&3"
@@ -251,7 +297,9 @@ if you don't have push access to that namespace.
 | Problem | Fix |
 |---------|-----|
 | `Permission denied` in app or DB logs after upgrading | Old volumes are owned by root. Run `docker compose down -v` and start again. |
-| `port is already allocated` | Another service is using 80/8080/3306. Stop it, or change the host side of the port mapping, e.g. `"8081:8080"`. |
+| `port is already allocated` | Another service is using port 80. Stop it, or change the host side of the mapping, e.g. `"8081:80"`. |
+| `Access denied for user 'vproapp'` / RabbitMQ `ACCESS_REFUSED` | The volumes were created with old or other passwords. Run `docker compose down -v` and start again. |
+| `secret ... not found` / `no such file` for `./secrets/...` | Run `./generate-secrets.sh`. |
 | Login page shows a DB / JDBC error | MySQL was still starting up. Run `docker compose restart vproapp`. |
 | Tables missing in `accounts` | The volume was created before the SQL file was added. Run `docker compose down -v` and start again. |
 | `502 Bad Gateway` from Nginx | Tomcat is still deploying the WAR. Check `docker compose logs -f vproapp`. |

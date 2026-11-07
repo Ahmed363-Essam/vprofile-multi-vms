@@ -11,8 +11,10 @@ services:
     ports:
       - "3306:3306"
     environment:
-      - MYSQL_ROOT_PASSWORD=vprodbpass
+      - MYSQL_ROOT_PASSWORD_FILE=/run/secrets/db_mysql_root_password
       - MYSQL_DATABASE=accounts
+    secrets:
+      - db_mysql_root_password
     volumes:
       - vprodbdata:/var/lib/mysql
 
@@ -23,7 +25,11 @@ services:
     user: memcache
     ports:
       - "11211:11211"
-
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
 
   vpromq01:
     image: rabbitmq
@@ -32,9 +38,24 @@ services:
       - vprofile-net
     ports:
       - "5672:5672"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
     environment:
       - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
+    secrets:
+      - rabbit_mq_password
+    # RabbitMQ has no *_FILE variable, so read the secret file into
+    # RABBITMQ_DEFAULT_PASS right before starting the server
+    entrypoint:
+      - sh
+      - -c
+      - RABBITMQ_DEFAULT_PASS="$$(cat /run/secrets/rabbit_mq_password)" exec docker-entrypoint.sh rabbitmq-server
 
   vproapp:
     build:
@@ -47,23 +68,27 @@ services:
       - vprofile-net
     ports:
       - "8080:8080"
-    environment:
-      - DB_HOST=vprodb
-      - DB_PORT=3306
-      - DB_USER=root
-      - DB_PASSWORD=vprodbpass
-      - CACHE_HOST=vprocache01
-      - CACHE_PORT=11211
-      - MQ_HOST=vpromq01
-      - MQ_PORT=5672
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
 
-
+    depends_on:
+      - vprodb
+      - vprocache01
+      - vpromq01
 
   vproweb:
-    build: 
+    build:
       context: ./docker/web
     image: vprocontainers/vprofileweb
     container_name: vproweb
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
     networks:
       - vprofile-net
     depends_on:
@@ -71,8 +96,16 @@ services:
     ports:
       - "80:80"
 
+secrets:
+  db_mysql_root_password:
+    file: ./secrets/db_mysql_root_password.txt
+  rabbit_mq_password:
+    file: ./secrets/rabbit_mq_password.txt
+
 volumes:
   vprodbdata: {}
+  rabbitmqdata: {}
+
 networks:
   vprofile-net:
     driver: bridge
