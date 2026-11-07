@@ -7,6 +7,7 @@ services:
     image: vprocontainers/vprofiledb
     container_name: vprodb
     restart: always
+    read_only: true
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
     security_opt:
@@ -26,6 +27,7 @@ services:
   vprocache01:
     image: memcached
     restart: always
+    read_only: true
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
     security_opt:
@@ -44,6 +46,7 @@ services:
   vpromq01:
     image: rabbitmq
     restart: always
+    read_only: true
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
     security_opt:
@@ -76,6 +79,7 @@ services:
     build:
       context: ./docker/app
       dockerfile: Dockerfile
+    read_only: true
     restart: always
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
@@ -104,6 +108,7 @@ services:
       context: ./docker/web
     image: vprocontainers/vprofileweb
     container_name: vproweb
+    read_only: true
     restart: always
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
