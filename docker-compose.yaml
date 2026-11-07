@@ -6,6 +6,7 @@ services:
 
     image: vprocontainers/vprofiledb
     container_name: vprodb
+    restart: always
     networks:
       - vprofile-net
     ports:
@@ -20,6 +21,7 @@ services:
 
   vprocache01:
     image: memcached
+    restart: always
     networks:
       - vprofile-net
     user: memcache
@@ -33,6 +35,7 @@ services:
 
   vpromq01:
     image: rabbitmq
+    restart: always
     user: rabbitmq
     networks:
       - vprofile-net
@@ -61,6 +64,7 @@ services:
     build:
       context: ./docker/app
       dockerfile: Dockerfile
+    restart: always
 
     image: vprocontainers/vprofileapp
     container_name: vproapp
@@ -84,6 +88,7 @@ services:
       context: ./docker/web
     image: vprocontainers/vprofileweb
     container_name: vproweb
+    restart: always
     deploy:
       resources:
         limits:
