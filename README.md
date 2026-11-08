@@ -1118,6 +1118,7 @@ The same works for the agent: `sudo systemctl stop zabbix-agent` makes the ZBX i
 
 ## Troubleshooting
 
+
 Logs: agent `/var/log/zabbix/zabbix_agentd.log` (on the monitored VM), server `/var/log/zabbix/zabbix_server.log`
 and web interface `/var/log/apache2/error.log` (on `zabbix01`).
 
