@@ -1121,6 +1121,7 @@ The same works for the agent: `sudo systemctl stop zabbix-agent` makes the ZBX i
 Logs: agent `/var/log/zabbix/zabbix_agentd.log` (on the monitored VM), server `/var/log/zabbix/zabbix_server.log`
 and web interface `/var/log/apache2/error.log` (on `zabbix01`).
 
+
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `E: Unable to locate package zabbix-...` | `apt update` skipped after adding the repo | `sudo apt update`, then install again |
