@@ -7,7 +7,7 @@ services:
     image: vprocontainers/vprofiledb
     container_name: vprodb
     restart: always
-    read_only: true
+  
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
     security_opt:
@@ -44,7 +44,13 @@ services:
           memory: 512M
 
   vpromq01:
-    image: rabbitmq
+    # same RabbitMQ 4.4 + management plugin (HTTP API on 15672, internal only)
+    # used by Zabbix "RabbitMQ node by HTTP" template
+    image: rabbitmq:4.4-management
+    # fixed node name rabbit@vpromq01: without it the node is named after the
+    # random container ID, so every recreate starts an empty RabbitMQ database
+    # (users, queues lost) and Zabbix can't find the node
+    hostname: vpromq01
     restart: always
     read_only: true
     cap_drop:
@@ -79,7 +85,7 @@ services:
     build:
       context: ./docker/app
       dockerfile: Dockerfile
-    read_only: true
+   
     restart: always
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
@@ -97,6 +103,8 @@ services:
         limits:
           cpus: '0.50'
           memory: 512M
+    secrets:
+      - tomcat_jmx_password       # enables JMX on 12345 for Zabbix (docker/app/setenv.sh)
 
     depends_on:
       - vprodb
@@ -108,7 +116,6 @@ services:
       context: ./docker/web
     image: vprocontainers/vprofileweb
     container_name: vproweb
-    read_only: true
     restart: always
     cap_drop:
       - ALL                       # no Linux capabilities (runs as non-root)
@@ -126,18 +133,150 @@ services:
     ports:
       - "80:80"
 
+  # ---------------------------------------------------------------------------
+  # Zabbix 7.0 LTS monitoring
+  #   zabbix-db           PostgreSQL for Zabbix's own data
+  #   zabbix-server       collects metrics, evaluates triggers
+  #   zabbix-web          UI -> http://localhost:8082
+  #   zabbix-agent2       MySQL + Memcached plugins
+  #   zabbix-java-gateway JMX bridge for Tomcat
+  # Hosts/templates are registered by ./zabbix/setup-hosts.py
+  # ---------------------------------------------------------------------------
+  zabbix-db:
+    image: postgres:16-alpine
+    restart: always
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - zabbix-net
+    environment:
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER=zabbix
+      - POSTGRES_PASSWORD_FILE=/run/secrets/zabbix_db_password
+    secrets:
+      - zabbix_db_password
+    volumes:
+      - zabbixdbdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:alpine-7.0-latest
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - zabbix-net                # talks to zabbix-db / zabbix-web
+      - vprofile-net              # polls nginx, rabbitmq, agent2, java gateway
+    environment:
+      - DB_SERVER_HOST=zabbix-db
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER=zabbix
+      - POSTGRES_PASSWORD_FILE=/run/secrets/zabbix_db_password
+      - ZBX_JAVAGATEWAY_ENABLE=true
+      - ZBX_JAVAGATEWAY=zabbix-java-gateway
+      - ZBX_STARTJAVAPOLLERS=5
+    secrets:
+      - zabbix_db_password
+    depends_on:
+      - zabbix-db
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:alpine-7.0-latest
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - zabbix-net
+    ports:
+      - "8082:8080"               # Zabbix UI
+    environment:
+      - ZBX_SERVER_HOST=zabbix-server
+      - DB_SERVER_HOST=zabbix-db
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER=zabbix
+      - POSTGRES_PASSWORD_FILE=/run/secrets/zabbix_db_password
+      - PHP_TZ=Asia/Amman
+    secrets:
+      - zabbix_db_password
+    depends_on:
+      - zabbix-server
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+
+  zabbix-agent2:
+    image: zabbix/zabbix-agent2:alpine-7.0-latest
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - vprofile-net              # reaches vprodb:3306 and vprocache01:11211
+    environment:
+      - ZBX_HOSTNAME=zabbix-agent2
+      - ZBX_SERVER_HOST=zabbix-server
+    depends_on:
+      - zabbix-server
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
+  zabbix-java-gateway:
+    image: zabbix/zabbix-java-gateway:alpine-7.0-latest
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - vprofile-net              # reaches vproapp:12345 (JMX)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
 secrets:
   db_mysql_root_password:
     file: ./secrets/db_mysql_root_password.txt
   rabbit_mq_password:
     file: ./secrets/rabbit_mq_password.txt
+  # Zabbix (create with ./zabbix/generate-secrets.sh)
+  zabbix_db_password:
+    file: ./secrets/zabbix_db_password.txt
+  tomcat_jmx_password:
+    file: ./secrets/tomcat_jmx_password.txt
 
 volumes:
   vprodbdata: {}
   rabbitmqdata: {}
+  zabbixdbdata: {}
 
 networks:
   vprofile-net:
+    driver: bridge
+  zabbix-net:
     driver: bridge
 
 

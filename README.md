@@ -305,6 +305,65 @@ if you don't have push access to that namespace.
 | `502 Bad Gateway` from Nginx | Tomcat is still deploying the WAR. Check `docker compose logs -f vproapp`. |
 | Code changes not visible | The app image builds the upstream repo. See [Building from local source](#building-from-local-source-optional). |
 
+## Monitoring with Zabbix
+
+Zabbix 7.0 LTS runs in the same compose project and monitors all five vprofile services.
+
+```
+                      zabbix-net                          vprofile-net
+ Browser :8082 ──► zabbix-web ──► zabbix-server ──┬──► zabbix-agent2 ──┬──► vprodb      (MySQL plugin)
+                        │              │          │                    └──► vprocache01 (Memcached plugin)
+                        └──► zabbix-db ┘          ├──► vpromq01:15672   (RabbitMQ management API)
+                           (PostgreSQL)           ├──► vproweb:8081     (Nginx stub_status)
+                                                  └──► zabbix-java-gateway ──► vproapp:12345 (Tomcat JMX)
+```
+
+| Zabbix host   | Template                      | How it connects |
+|---------------|-------------------------------|-----------------|
+| `vprodb`      | MySQL by Zabbix agent 2       | agent2 → `tcp://vprodb:3306` as read-only user `zbx_monitor` |
+| `vprocache01` | Memcached by Zabbix agent 2   | agent2 → `tcp://vprocache01:11211` |
+| `vpromq01`    | RabbitMQ node by HTTP         | `http://vpromq01:15672` as user `zbx_monitor` (tag `monitoring`) |
+| `vproapp`     | Apache Tomcat by JMX          | Java gateway → `vproapp:12345`, JMX user `zabbix` (read-only, password protected) |
+| `vproweb`     | Nginx by HTTP                 | `http://vproweb:8081/basic_status` |
+
+Only the Zabbix UI (`8082`) is published to the host. The monitoring ports (JMX 12345,
+RabbitMQ API 15672, Nginx status 8081, agent 10050) are reachable only inside the Docker
+networks. All Zabbix containers run as non-root with `cap_drop: ALL`.
+
+### Setup
+
+```bash
+./zabbix/generate-secrets.sh    # creates Zabbix passwords in ./secrets/ (keeps existing ones)
+docker compose up -d --build
+./zabbix/setup-hosts.py         # creates monitoring users and registers the 5 hosts
+```
+
+`setup-hosts.py` is safe to run again. Run it again after `docker compose down -v`,
+because the MySQL and RabbitMQ monitoring users are stored in those volumes.
+It also changes the Zabbix `Admin` password from the default `zabbix`.
+
+Open **http://localhost:8082** and log in as `Admin` with the password from
+`secrets/zabbix_admin_password.txt`. Go to *Monitoring → Hosts* (group `vprofile`).
+
+| Secret file                          | Used for |
+|--------------------------------------|----------|
+| `zabbix_db_password.txt`             | Zabbix's PostgreSQL database |
+| `zabbix_admin_password.txt`          | Zabbix UI `Admin` login |
+| `zbx_mysql_monitor_password.txt`     | MySQL `zbx_monitor` user |
+| `zbx_rabbitmq_monitor_password.txt`  | RabbitMQ `zbx_monitor` user |
+| `tomcat_jmx_password.txt`            | Tomcat JMX (`docker/app/setenv.sh`) |
+
+The passwords are stored in Zabbix as *secret* macros, so they're hidden in the UI.
+
+### Changes to the services for monitoring
+
+- **vpromq01:** image `rabbitmq:4.4-management` (same version plus the HTTP API), and a
+  fixed `hostname: vpromq01`. Without a fixed hostname, every recreate started a new,
+  empty RabbitMQ node database.
+- **vproapp:** `docker/app/setenv.sh` turns on JMX with password auth when the
+  `tomcat_jmx_password` secret is mounted.
+- **vproweb:** `docker/web/default.conf` has a second server on port 8081 with `stub_status`.
+
 ## Other setups in this repo
 
 - `vagrant/`: multi-VM setup with Vagrant

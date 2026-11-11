@@ -18,6 +18,9 @@ RUN groupadd --system --gid 1001 tomcat && \
 RUN rm -rf /usr/local/tomcat/webapps/*
 COPY --from=BUILD_IMAGE --chown=tomcat:tomcat /app/vprofile-project/target/vprofile-v2.war /usr/local/tomcat/webapps/ROOT.war
 
+# enables password-protected JMX for Zabbix monitoring (see setenv.sh)
+COPY setenv.sh /usr/local/tomcat/bin/setenv.sh
+
 # Tomcat must be able to write logs, temp files, work dir and unpack the WAR
 RUN chown -R tomcat:tomcat /usr/local/tomcat
 
